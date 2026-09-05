@@ -8,7 +8,7 @@ import requests
 
 CHANNEL_HANDLE = os.getenv("YOUTUBE_HANDLE", "@aung3d")
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@happydayfor").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip() or "@happydayfor"
 STATE_FILE = Path("sent_videos.json")
 
 
@@ -39,7 +39,6 @@ def load_sent() -> set[str]:
 
 
 def save_sent(sent: set[str]) -> None:
-    # Keep the state small while retaining enough history to prevent duplicates.
     STATE_FILE.write_text(
         json.dumps(sorted(sent)[-5000:], ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -53,10 +52,14 @@ def send_telegram(text: str) -> None:
         data={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": False},
         timeout=30,
     )
-    r.raise_for_status()
-    result = r.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Telegram API error: {result}")
+    try:
+        result = r.json()
+    except ValueError:
+        result = {"ok": False, "description": r.text}
+    if not r.ok or not result.get("ok"):
+        raise RuntimeError(
+            f"Telegram API error for chat_id={CHAT_ID!r}: {result}"
+        )
 
 
 def main() -> None:
@@ -73,7 +76,6 @@ def main() -> None:
         if video_id and video_id not in sent:
             new_entries.append((entry, video_id))
 
-    # RSS is newest-first. Send oldest first if several videos appeared between runs.
     for entry, video_id in reversed(new_entries):
         title = entry.get("title", "New YouTube video")
         video_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -82,7 +84,7 @@ def main() -> None:
         sent.add(video_id)
 
     save_sent(sent)
-    print(f"Checked {CHANNEL_HANDLE}: {len(new_entries)} new video(s) sent.")
+    print(f"Checked {CHANNEL_HANDLE}: {len(new_entries)} new video(s) sent to {CHAT_ID}.")
 
 
 if __name__ == "__main__":
