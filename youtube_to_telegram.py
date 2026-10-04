@@ -144,7 +144,7 @@ def main() -> None:
                     break
                 last_error = (
                     f"Empty/invalid XML feed, parser="
-                    f"{getattr(parsed, "bozo_exception", "unknown")}"
+                    f"{getattr(parsed, 'bozo_exception', 'unknown')}"
                 )
         except requests.RequestException as exc:
             last_error = str(exc)
