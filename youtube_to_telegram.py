@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import feedparser
@@ -108,11 +109,57 @@ def main() -> None:
 
     channel_id = get_channel_id(CHANNEL_HANDLE)
     feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-    feed = feedparser.parse(feed_url)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+        ),
+        "Accept": "application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+    }
 
-    if getattr(feed, "bozo", False) and not feed.entries:
+    feed = None
+    last_error = "unknown error"
+    for attempt in range(1, 6):
+        try:
+            response = requests.get(feed_url, headers=headers, timeout=30)
+            content_type = response.headers.get("content-type", "")
+            body = response.content
+
+            if not response.ok:
+                last_error = (
+                    f"HTTP {response.status_code}, content-type={content_type}, "
+                    f"body={response.text[:200]!r}"
+                )
+            elif not body.lstrip().startswith(b"<"):
+                last_error = (
+                    f"Unexpected non-XML response, content-type={content_type}, "
+                    f"body={response.text[:200]!r}"
+                )
+            else:
+                parsed = feedparser.parse(body)
+                if parsed.entries:
+                    feed = parsed
+                    if getattr(parsed, "bozo", False):
+                        print("Warning: YouTube XML had a parse warning, but entries were recovered.")
+                    break
+                last_error = (
+                    f"Empty/invalid XML feed, parser="
+                    f"{getattr(parsed, "bozo_exception", "unknown")}"
+                )
+        except requests.RequestException as exc:
+            last_error = str(exc)
+
+        if attempt < 5:
+            delay = 5 * attempt
+            print(
+                f"YouTube feed attempt {attempt}/5 failed: {last_error}. "
+                f"Retrying in {delay}s..."
+            )
+            time.sleep(delay)
+
+    if feed is None:
         raise RuntimeError(
-            f"Could not read YouTube RSS feed: {feed.bozo_exception}"
+            f"Could not read YouTube RSS feed after 5 attempts: {last_error}"
         )
 
     sent = load_sent()
