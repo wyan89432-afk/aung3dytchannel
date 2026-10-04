@@ -1,10 +1,8 @@
 import json
 import os
 import re
-import time
 from pathlib import Path
 
-import feedparser
 import requests
 
 CHANNEL_HANDLE = os.getenv("YOUTUBE_HANDLE", "@aung3d").strip()
@@ -14,14 +12,25 @@ STATE_FILE = Path("sent_videos.json")
 MAX_SAVED_VIDEOS = 5000
 
 
-def get_channel_id(handle: str) -> str:
-    url = f"https://www.youtube.com/{handle}"
+def get_channel_page(handle: str) -> str:
+    url = f"https://www.youtube.com/{handle}/videos"
     response = requests.get(
         url,
         timeout=30,
-        headers={"User-Agent": "Mozilla/5.0"},
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     )
     response.raise_for_status()
+    return response.text
+
+
+def get_channel_id(handle: str) -> str:
+    html = get_channel_page(handle)
 
     patterns = (
         r'"channelId":"(UC[a-zA-Z0-9_-]+)"',
@@ -29,11 +38,77 @@ def get_channel_id(handle: str) -> str:
         r'channel/(UC[a-zA-Z0-9_-]+)',
     )
     for pattern in patterns:
-        match = re.search(pattern, response.text)
+        match = re.search(pattern, html)
         if match:
             return match.group(1)
 
     raise RuntimeError(f"Could not find YouTube channel ID for {handle}")
+
+
+def _walk_video_renderers(value, results: list[tuple[str, str]]) -> None:
+    if isinstance(value, dict):
+        renderer = value.get("videoRenderer")
+        if isinstance(renderer, dict):
+            video_id = renderer.get("videoId")
+            title = ""
+            title_obj = renderer.get("title", {})
+            if isinstance(title_obj, dict):
+                runs = title_obj.get("runs", [])
+                if isinstance(runs, list):
+                    title = "".join(
+                        run.get("text", "")
+                        for run in runs
+                        if isinstance(run, dict)
+                    )
+                if not title:
+                    title = title_obj.get("simpleText", "") or ""
+            if video_id:
+                results.append((video_id, title or "New YouTube video"))
+
+        for child in value.values():
+            _walk_video_renderers(child, results)
+
+    elif isinstance(value, list):
+        for child in value:
+            _walk_video_renderers(child, results)
+
+
+def get_latest_videos_from_channel_page(html: str) -> list[tuple[str, str]]:
+    match = re.search(
+        r'var ytInitialData\s*=\s*({.*?});\s*</script>',
+        html,
+        flags=re.DOTALL,
+    )
+
+    if not match:
+        match = re.search(
+            r'ytInitialData\s*=\s*({.*?})\s*;',
+            html,
+            flags=re.DOTALL,
+        )
+
+    if not match:
+        raise RuntimeError("YouTube channel page did not contain ytInitialData")
+
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Could not parse YouTube channel page data: {exc}") from exc
+
+    found: list[tuple[str, str]] = []
+    _walk_video_renderers(data, found)
+
+    unique: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for video_id, title in found:
+        if video_id not in seen:
+            seen.add(video_id)
+            unique.append((video_id, title))
+
+    if not unique:
+        raise RuntimeError("Could not find any videos on the YouTube channel page")
+
+    return unique
 
 
 def load_sent() -> set[str]:
