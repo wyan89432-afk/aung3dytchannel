@@ -13,7 +13,7 @@ MAX_SAVED_VIDEOS = 5000
 
 
 def get_channel_page(handle: str) -> str:
-    url = f"https://www.youtube.com/{handle}/videos"
+    url = f"https://www.youtube.com/{handle}/videos?hl=en&gl=US"
     response = requests.get(
         url,
         timeout=30,
@@ -22,6 +22,7 @@ def get_channel_page(handle: str) -> str:
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
             ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         },
     )
@@ -29,9 +30,38 @@ def get_channel_page(handle: str) -> str:
     return response.text
 
 
-def get_channel_id(handle: str) -> str:
-    html = get_channel_page(handle)
+def extract_initial_data(html: str) -> dict:
+    script_match = re.search(
+        r'<script[^>]+id="ytInitialData"[^>]*>(.*?)</script>',
+        html,
+        flags=re.DOTALL,
+    )
 
+    if script_match:
+        raw = script_match.group(1).strip()
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    marker = "var ytInitialData = "
+    start = html.find(marker)
+    if start != -1:
+        start += len(marker)
+        decoder = json.JSONDecoder()
+        try:
+            data, _ = decoder.raw_decode(html[start:].lstrip())
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    raise RuntimeError("YouTube page did not contain usable ytInitialData")
+
+
+def get_channel_id(html: str, handle: str) -> str:
     patterns = (
         r'"channelId":"(UC[a-zA-Z0-9_-]+)"',
         r'"externalId":"(UC[a-zA-Z0-9_-]+)"',
@@ -41,7 +71,6 @@ def get_channel_id(handle: str) -> str:
         match = re.search(pattern, html)
         if match:
             return match.group(1)
-
     raise RuntimeError(f"Could not find YouTube channel ID for {handle}")
 
 
@@ -62,7 +91,8 @@ def _walk_video_renderers(value, results: list[tuple[str, str]]) -> None:
                     )
                 if not title:
                     title = title_obj.get("simpleText", "") or ""
-            if video_id:
+
+            if isinstance(video_id, str) and video_id:
                 results.append((video_id, title or "New YouTube video"))
 
         for child in value.values():
@@ -73,28 +103,8 @@ def _walk_video_renderers(value, results: list[tuple[str, str]]) -> None:
             _walk_video_renderers(child, results)
 
 
-def get_latest_videos_from_channel_page(html: str) -> list[tuple[str, str]]:
-    match = re.search(
-        r'var ytInitialData\s*=\s*({.*?});\s*</script>',
-        html,
-        flags=re.DOTALL,
-    )
-
-    if not match:
-        match = re.search(
-            r'ytInitialData\s*=\s*({.*?})\s*;',
-            html,
-            flags=re.DOTALL,
-        )
-
-    if not match:
-        raise RuntimeError("YouTube channel page did not contain ytInitialData")
-
-    try:
-        data = json.loads(match.group(1))
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Could not parse YouTube channel page data: {exc}") from exc
-
+def get_latest_videos(html: str) -> list[tuple[str, str]]:
+    data = extract_initial_data(html)
     found: list[tuple[str, str]] = []
     _walk_video_renderers(data, found)
 
@@ -104,6 +114,14 @@ def get_latest_videos_from_channel_page(html: str) -> list[tuple[str, str]]:
         if video_id not in seen:
             seen.add(video_id)
             unique.append((video_id, title))
+
+    if not unique:
+        # Last-resort extraction when YouTube changes renderer names.
+        ids = re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', html)
+        for video_id in ids:
+            if video_id not in seen:
+                seen.add(video_id)
+                unique.append((video_id, "New YouTube video"))
 
     if not unique:
         raise RuntimeError("Could not find any videos on the YouTube channel page")
@@ -149,7 +167,6 @@ def validate_telegram() -> None:
             "TELEGRAM_CHAT_ID is missing. Use @channelusername or a numeric chat ID."
         )
 
-    # This gives a clear error before trying to send messages.
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChat"
     response = requests.post(url, json={"chat_id": CHAT_ID}, timeout=30)
     if not response.ok:
@@ -180,74 +197,25 @@ def send_telegram(text: str) -> None:
 
 def main() -> None:
     print(f"Checking YouTube channel {CHANNEL_HANDLE}...")
+
     validate_telegram()
 
-    channel_id = get_channel_id(CHANNEL_HANDLE)
-    feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
-        ),
-        "Accept": "application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-    }
+    html = get_channel_page(CHANNEL_HANDLE)
+    channel_id = get_channel_id(html, CHANNEL_HANDLE)
+    print(f"Resolved channel ID: {channel_id}")
 
-    feed = None
-    last_error = "unknown error"
-    for attempt in range(1, 6):
-        try:
-            response = requests.get(feed_url, headers=headers, timeout=30)
-            content_type = response.headers.get("content-type", "")
-            body = response.content
-
-            if not response.ok:
-                last_error = (
-                    f"HTTP {response.status_code}, content-type={content_type}, "
-                    f"body={response.text[:200]!r}"
-                )
-            elif not body.lstrip().startswith(b"<"):
-                last_error = (
-                    f"Unexpected non-XML response, content-type={content_type}, "
-                    f"body={response.text[:200]!r}"
-                )
-            else:
-                parsed = feedparser.parse(body)
-                if parsed.entries:
-                    feed = parsed
-                    if getattr(parsed, "bozo", False):
-                        print("Warning: YouTube XML had a parse warning, but entries were recovered.")
-                    break
-                last_error = (
-                    f"Empty/invalid XML feed, parser="
-                    f"{getattr(parsed, 'bozo_exception', 'unknown')}"
-                )
-        except requests.RequestException as exc:
-            last_error = str(exc)
-
-        if attempt < 5:
-            delay = 5 * attempt
-            print(
-                f"YouTube feed attempt {attempt}/5 failed: {last_error}. "
-                f"Retrying in {delay}s..."
-            )
-            time.sleep(delay)
-
-    if feed is None:
-        raise RuntimeError(
-            f"Could not read YouTube RSS feed after 5 attempts: {last_error}"
-        )
+    latest_videos = get_latest_videos(html)
+    print(f"Found {len(latest_videos)} video(s) on the channel page.")
 
     sent = load_sent()
-    new_entries = []
+    new_entries = [
+        (video_id, title)
+        for video_id, title in latest_videos
+        if video_id not in sent
+    ]
 
-    for entry in feed.entries:
-        video_id = entry.get("yt_videoid") or entry.get("id", "").split(":")[-1]
-        if video_id and video_id not in sent:
-            new_entries.append((entry, video_id))
-
-    # RSS is newest-first. Send oldest unseen video first.
-    for entry, video_id in reversed(new_entries):
-        title = entry.get("title", "New YouTube video")
+    # YouTube page data is normally newest-first. Send oldest unseen first.
+    for video_id, title in reversed(new_entries):
         video_url = f"https://www.youtube.com/watch?v={video_id}"
         message = f"🎬 New video from Aung3D\n\n{title}\n\n{video_url}"
 
@@ -256,6 +224,7 @@ def main() -> None:
         print(f"Sent: {title} ({video_id})")
 
     save_sent(sent)
+
     print(
         f"Done. Checked {CHANNEL_HANDLE}: "
         f"{len(new_entries)} new video(s) sent to {CHAT_ID}."
